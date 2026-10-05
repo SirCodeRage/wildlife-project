@@ -5,6 +5,8 @@ import base64
 import subprocess
 import time
 import io
+import shutil
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -13,6 +15,7 @@ IMAGE_FOLDER = r"F:\Organised_Photos\2025\04\09"
 SERVER_URL = "http://127.0.0.1:1234/v1/chat/completions"
 MODEL_NAME = "qwen/qwen3-vl-8b"
 EXIFTOOL_PATH = r"c:\Users\James\Documents\coding\wildlife projecxts\exiftool.exe"
+FFMPEG_PATH = r"C:\ffmpeg.exe"  # HDR/HEVC CR3 previews are not JPEG
 INDEX_FILE = r"c:\Users\James\Documents\coding\wildlife projecxts\animal_index.json"
 RAW_EXTENSIONS = ('.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.raf')
 MAX_IMAGE_SIDE = 1280  # VL models downsample anyway; huge previews just cost encode + vision tokens
@@ -33,8 +36,11 @@ PROMPT_TEXT = (
 print_lock = threading.Lock()
 db_lock = threading.Lock()
 exiftool_lock = threading.Lock()
+_ffmpeg_lock = threading.Lock()
 _thread_local = threading.local()
 PREVIEW_TAGS = ("PreviewImage", "JpgFromRaw", "OtherImage", "ThumbnailImage")
+_ffmpeg_path = None
+_ffmpeg_checked = False
 
 
 def get_http():
@@ -50,23 +56,154 @@ def log(msg):
         print(msg)
 
 
+def find_ffmpeg():
+    global _ffmpeg_path, _ffmpeg_checked
+    with _ffmpeg_lock:
+        if _ffmpeg_checked:
+            return _ffmpeg_path
+        _ffmpeg_checked = True
+        dirname = os.path.dirname(EXIFTOOL_PATH)
+        candidates = [
+            FFMPEG_PATH,
+            shutil.which(FFMPEG_PATH),
+            shutil.which("ffmpeg"),
+            shutil.which("ffmpeg.exe"),
+            os.path.join(dirname, "ffmpeg.exe"),
+            os.path.join(dirname, "ffmpeg"),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                _ffmpeg_path = candidate
+                return _ffmpeg_path
+            # Windows .exe from an explicit path may not report X_OK the same way
+            if candidate and os.path.isfile(candidate) and candidate.lower().endswith(".exe"):
+                _ffmpeg_path = candidate
+                return _ffmpeg_path
+        _ffmpeg_path = None
+        return None
+
+
+def _hvcc_param_nals(hvcc_payload):
+    if len(hvcc_payload) < 23:
+        return []
+    num_arrays = hvcc_payload[22]
+    pos = 23
+    nals = []
+    for _ in range(num_arrays):
+        if pos + 3 > len(hvcc_payload):
+            return []
+        num_nalus = int.from_bytes(hvcc_payload[pos + 1:pos + 3], "big")
+        pos += 3
+        for _ in range(num_nalus):
+            if pos + 2 > len(hvcc_payload):
+                return []
+            nal_len = int.from_bytes(hvcc_payload[pos:pos + 2], "big")
+            pos += 2
+            nals.append(hvcc_payload[pos:pos + nal_len])
+            pos += nal_len
+    return nals
+
+
+def _imgd_nals(imgd_payload):
+    # Canon IMGD: 4-byte outer length, then length-prefixed HEVC NALUs.
+    pos = 4
+    nals = []
+    while pos + 4 <= len(imgd_payload):
+        nlen = int.from_bytes(imgd_payload[pos:pos + 4], "big")
+        pos += 4
+        if nlen <= 0 or pos + nlen > len(imgd_payload):
+            return []
+        nals.append(imgd_payload[pos:pos + nlen])
+        pos += nlen
+    return nals
+
+
+def _cr3_hevc_annexb(raw_bytes):
+    start_code = b"\x00\x00\x00\x01"
+    for fourcc in (b"PRVW", b"THMB"):
+        type_pos = raw_bytes.find(fourcc)
+        if type_pos < 4:
+            continue
+        start = type_pos - 4
+        size = int.from_bytes(raw_bytes[start:start + 4], "big")
+        if size < 32 or start + size > len(raw_bytes):
+            continue
+        end = start + size
+        hvcc_type = raw_bytes.find(b"hvcC", start, end)
+        imgd_type = raw_bytes.find(b"IMGD", start, end)
+        if hvcc_type < 4 or imgd_type < 4:
+            continue
+        hvcc_pos = hvcc_type - 4
+        imgd_pos = imgd_type - 4
+        hvcc_size = int.from_bytes(raw_bytes[hvcc_pos:hvcc_pos + 4], "big")
+        imgd_size = int.from_bytes(raw_bytes[imgd_pos:imgd_pos + 4], "big")
+        if hvcc_pos + hvcc_size > end or imgd_pos + imgd_size > end:
+            continue
+        params = _hvcc_param_nals(raw_bytes[hvcc_pos + 8:hvcc_pos + hvcc_size])
+        pictures = _imgd_nals(raw_bytes[imgd_pos + 8:imgd_pos + imgd_size])
+        if not params or not pictures:
+            continue
+        return b"".join(start_code + nal for nal in params + pictures)
+    return None
+
+
+def _ffmpeg_hevc_to_jpeg(annexb):
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise Exception(
+            "CR3 preview is HEVC (not JPEG). Install ffmpeg and put it on PATH, or set FFMPEG_PATH."
+        )
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with tempfile.TemporaryDirectory() as tmp:
+        h265_path = os.path.join(tmp, "preview.h265")
+        jpg_path = os.path.join(tmp, "preview.jpg")
+        with open(h265_path, "wb") as handle:
+            handle.write(annexb)
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "hevc", "-i", h265_path,
+             "-frames:v", "1", "-q:v", "2", jpg_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **kwargs,
+        )
+        if result.returncode != 0 or not os.path.isfile(jpg_path):
+            err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+            raise Exception(f"ffmpeg HEVC preview decode failed. {err}")
+        with open(jpg_path, "rb") as handle:
+            jpeg_bytes = handle.read()
+        if not jpeg_bytes.startswith(b"\xff\xd8"):
+            raise Exception("ffmpeg HEVC preview decode failed. (output was not JPEG)")
+        return jpeg_bytes
+
+
 def extract_preview_jpeg(raw_path):
     # Windows exiftool.exe unpacks to a shared temp dir; parallel copies collide.
-    # -fast2 also skips MakerNotes / extra boxes that CR3 previews live in.
     last_err = ""
-    with exiftool_lock:
-        for tag in PREVIEW_TAGS:
-            result = subprocess.run(
-                [EXIFTOOL_PATH, "-b", f"-{tag}", raw_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            jpeg_bytes = result.stdout or b""
-            if jpeg_bytes.startswith(b"\xff\xd8"):
-                return jpeg_bytes
-            err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
-            if err:
-                last_err = err
+    try:
+        with exiftool_lock:
+            for tag in PREVIEW_TAGS:
+                result = subprocess.run(
+                    [EXIFTOOL_PATH, "-b", f"-{tag}", raw_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                jpeg_bytes = result.stdout or b""
+                if jpeg_bytes.startswith(b"\xff\xd8"):
+                    return jpeg_bytes
+                err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+                if err:
+                    last_err = err
+    except FileNotFoundError:
+        last_err = f"exiftool not found: {EXIFTOOL_PATH}"
+
+    with open(raw_path, "rb") as handle:
+        raw_bytes = handle.read()
+    annexb = _cr3_hevc_annexb(raw_bytes)
+    if annexb:
+        return _ffmpeg_hevc_to_jpeg(annexb)
+
     detail = f" ({last_err})" if last_err else ""
     raise Exception(f"ExifTool image conversion failed.{detail}")
 
@@ -155,29 +292,37 @@ def process_image(idx, img_name, total):
         time.sleep(1)
 
 
-# Load database progress safely
-if os.path.exists(INDEX_FILE):
-    with open(INDEX_FILE, 'r') as f:
-        database = json.load(f)
-    print(f"Loaded existing database index. {len(database)} images currently processed.")
-else:
-    database = {}
-    print("Starting a completely fresh database index.")
+database = {}
 
-all_images = [f for f in os.listdir(IMAGE_FOLDER) if f.lower().endswith(RAW_EXTENSIONS)]
-images_to_process = [img for img in all_images if img not in database]
-total = len(images_to_process)
 
-print(f"Found {len(all_images)} total images in folder. Processing remaining {total} files...")
+def main():
+    global database
+    if os.path.exists(INDEX_FILE):
+        with open(INDEX_FILE, 'r') as f:
+            database = json.load(f)
+        print(f"Loaded existing database index. {len(database)} images currently processed.")
+    else:
+        database = {}
+        print("Starting a completely fresh database index.")
 
-if total:
-    workers = max(1, min(MAX_WORKERS, total))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(process_image, idx, img_name, total)
-            for idx, img_name in enumerate(images_to_process, 1)
-        ]
-        for fut in as_completed(futures):
-            fut.result()
+    all_images = [f for f in os.listdir(IMAGE_FOLDER) if f.lower().endswith(RAW_EXTENSIONS)]
+    images_to_process = [img for img in all_images if img not in database]
+    total = len(images_to_process)
 
-print(f"\n🎉 Backlog catalog processing complete! Master index successfully updated at: {INDEX_FILE}")
+    print(f"Found {len(all_images)} total images in folder. Processing remaining {total} files...")
+
+    if total:
+        workers = max(1, min(MAX_WORKERS, total))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(process_image, idx, img_name, total)
+                for idx, img_name in enumerate(images_to_process, 1)
+            ]
+            for fut in as_completed(futures):
+                fut.result()
+
+    print(f"\n🎉 Backlog catalog processing complete! Master index successfully updated at: {INDEX_FILE}")
+
+
+if __name__ == "__main__":
+    main()
