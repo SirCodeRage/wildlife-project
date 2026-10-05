@@ -8,6 +8,7 @@ import io
 import shutil
 import tempfile
 import threading
+from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
@@ -19,7 +20,9 @@ FFMPEG_PATH = r"C:\ffmpeg.exe"  # HDR/HEVC CR3 previews are not JPEG
 INDEX_FILE = r"c:\Users\James\Documents\coding\wildlife projecxts\animal_index.json"
 RAW_EXTENSIONS = ('.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.raf')
 MAX_IMAGE_SIDE = 1280  # VL models downsample anyway; huge previews just cost encode + vision tokens
-MAX_WORKERS = 2  # 1 = old sequential runs; 2 overlaps the next extract with the VL call
+MAX_WORKERS = 5  # LLM / GPU calls
+EXTRACT_WORKERS = 5  # JPEG/HEVC extract; runs ahead of the model
+PREFETCH = 8  # extracted JPEGs allowed to sit waiting for the LLM
 
 PROMPT_TEXT = (
     "You are a professional British wildlife cataloguer. Analyze this photograph.\n"
@@ -162,7 +165,8 @@ def _ffmpeg_hevc_to_jpeg(annexb):
         with open(h265_path, "wb") as handle:
             handle.write(annexb)
         result = subprocess.run(
-            [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "hevc", "-i", h265_path,
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-threads", "1",
+             "-f", "hevc", "-i", h265_path, "-threads", "1",
              "-frames:v", "1", "-q:v", "2", jpg_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -179,8 +183,17 @@ def _ffmpeg_hevc_to_jpeg(annexb):
 
 
 def extract_preview_jpeg(raw_path):
-    # Windows exiftool.exe unpacks to a shared temp dir; parallel copies collide.
+    # HEVC CR3s first (skip serialized ExifTool). JPEG RAWs still use ExifTool.
     last_err = ""
+    with open(raw_path, "rb") as handle:
+        raw_bytes = handle.read()
+    annexb = _cr3_hevc_annexb(raw_bytes)
+    if annexb:
+        try:
+            return _ffmpeg_hevc_to_jpeg(annexb)
+        except Exception as e:
+            last_err = str(e)
+
     try:
         with exiftool_lock:
             for tag in PREVIEW_TAGS:
@@ -198,14 +211,8 @@ def extract_preview_jpeg(raw_path):
     except FileNotFoundError:
         last_err = f"exiftool not found: {EXIFTOOL_PATH}"
 
-    with open(raw_path, "rb") as handle:
-        raw_bytes = handle.read()
-    annexb = _cr3_hevc_annexb(raw_bytes)
-    if annexb:
-        return _ffmpeg_hevc_to_jpeg(annexb)
-
     detail = f" ({last_err})" if last_err else ""
-    raise Exception(f"ExifTool image conversion failed.{detail}")
+    raise Exception(f"Preview extract failed.{detail}")
 
 
 def jpeg_to_base64(jpeg_bytes):
@@ -245,51 +252,70 @@ def save_record(img_name, record):
             json.dump(database, f, indent=4)
 
 
-def process_image(idx, img_name, total):
+def classify_image(idx, img_name, img_path, base64_image):
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT_TEXT},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                ]
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 200,
+    }
+
+    response = get_http().post(SERVER_URL, json=payload, timeout=90)
+    response.raise_for_status()
+    response_data = response.json()
+
+    if 'error' in response_data:
+        log(f"   ↳ ❌ Server error on {img_name}: {response_data['error']}")
+        return
+
+    raw_content = strip_model_json(response_data['choices'][0]['message']['content'])
+    parsed_json = json.loads(raw_content)
+    record = {
+        "filename": img_name,
+        "file_path": os.path.abspath(img_path),
+        "animal_label": parsed_json.get("animal_label", "Unknown").strip(),
+        "scene_type": parsed_json.get("scene_type", "single_subject"),
+        "requires_manual_check": parsed_json.get("requires_manual_check", False),
+        "indexed_at": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    save_record(img_name, record)
+    status_flag = "⚠️ REVIEW NEEDED" if record["requires_manual_check"] else "✅ OK"
+    log(f"   ↳ Labeled: {record['animal_label']} | Type: {record['scene_type']} | [{status_flag}]")
+
+
+def extract_job(idx, img_name, total, llm_queue):
     img_path = os.path.join(IMAGE_FOLDER, img_name)
     log(f"[{idx}/{total}] Analyzing: {img_name}...")
-
     try:
         base64_image = jpeg_to_base64(extract_preview_jpeg(img_path))
-        payload = {
-            "model": MODEL_NAME,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": PROMPT_TEXT},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                    ]
-                }
-            ],
-            "temperature": 0.1,
-            "max_tokens": 200,
-        }
-
-        response = get_http().post(SERVER_URL, json=payload, timeout=90)
-        response.raise_for_status()
-        response_data = response.json()
-
-        if 'error' not in response_data:
-            raw_content = strip_model_json(response_data['choices'][0]['message']['content'])
-            parsed_json = json.loads(raw_content)
-            record = {
-                "filename": img_name,
-                "file_path": os.path.abspath(img_path),
-                "animal_label": parsed_json.get("animal_label", "Unknown").strip(),
-                "scene_type": parsed_json.get("scene_type", "single_subject"),
-                "requires_manual_check": parsed_json.get("requires_manual_check", False),
-                "indexed_at": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            save_record(img_name, record)
-            status_flag = "⚠️ REVIEW NEEDED" if record["requires_manual_check"] else "✅ OK"
-            log(f"   ↳ Labeled: {record['animal_label']} | Type: {record['scene_type']} | [{status_flag}]")
-        else:
-            log(f"   ↳ ❌ Server error on {img_name}: {response_data['error']}")
-
+        llm_queue.put((idx, img_name, img_path, base64_image))
     except Exception as e:
         log(f"   ↳ ❌ Extraction/Network parse failure on {img_name}: {e}")
         time.sleep(1)
+
+
+def llm_worker(llm_queue):
+    while True:
+        item = llm_queue.get()
+        try:
+            if item is None:
+                return
+            idx, img_name, img_path, base64_image = item
+            try:
+                classify_image(idx, img_name, img_path, base64_image)
+            except Exception as e:
+                log(f"   ↳ ❌ Extraction/Network parse failure on {img_name}: {e}")
+                time.sleep(1)
+        finally:
+            llm_queue.task_done()
 
 
 database = {}
@@ -312,14 +338,29 @@ def main():
     print(f"Found {len(all_images)} total images in folder. Processing remaining {total} files...")
 
     if total:
-        workers = max(1, min(MAX_WORKERS, total))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        extract_workers = max(1, min(EXTRACT_WORKERS, total))
+        llm_workers = max(1, min(MAX_WORKERS, total))
+        prefetch = max(PREFETCH, extract_workers, llm_workers)
+        llm_queue = Queue(maxsize=prefetch)
+
+        llm_threads = []
+        for _ in range(llm_workers):
+            thread = threading.Thread(target=llm_worker, args=(llm_queue,))
+            thread.start()
+            llm_threads.append(thread)
+
+        with ThreadPoolExecutor(max_workers=extract_workers) as executor:
             futures = [
-                executor.submit(process_image, idx, img_name, total)
+                executor.submit(extract_job, idx, img_name, total, llm_queue)
                 for idx, img_name in enumerate(images_to_process, 1)
             ]
             for fut in as_completed(futures):
                 fut.result()
+
+        for _ in range(llm_workers):
+            llm_queue.put(None)
+        for thread in llm_threads:
+            thread.join()
 
     print(f"\n🎉 Backlog catalog processing complete! Master index successfully updated at: {INDEX_FILE}")
 
