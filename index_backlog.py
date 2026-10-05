@@ -16,7 +16,7 @@ EXIFTOOL_PATH = r"c:\Users\James\Documents\coding\wildlife projecxts\exiftool.ex
 INDEX_FILE = r"c:\Users\James\Documents\coding\wildlife projecxts\animal_index.json"
 RAW_EXTENSIONS = ('.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.raf')
 MAX_IMAGE_SIDE = 1280  # VL models downsample anyway; huge previews just cost encode + vision tokens
-MAX_WORKERS = 2  # 1 = old sequential runs; 2 overlaps ExifTool with the VL call
+MAX_WORKERS = 2  # 1 = old sequential runs; 2 overlaps the next extract with the VL call
 
 PROMPT_TEXT = (
     "You are a professional British wildlife cataloguer. Analyze this photograph.\n"
@@ -32,7 +32,9 @@ PROMPT_TEXT = (
 
 print_lock = threading.Lock()
 db_lock = threading.Lock()
+exiftool_lock = threading.Lock()
 _thread_local = threading.local()
+PREVIEW_TAGS = ("PreviewImage", "JpgFromRaw", "OtherImage", "ThumbnailImage")
 
 
 def get_http():
@@ -49,14 +51,24 @@ def log(msg):
 
 
 def extract_preview_jpeg(raw_path):
-    cmd = [EXIFTOOL_PATH, "-fast2", "-b", "-PreviewImage", raw_path]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if result.returncode != 0 or not result.stdout:
-        cmd_fallback = [EXIFTOOL_PATH, "-fast2", "-b", "-JpgFromRaw", raw_path]
-        result = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    if result.returncode == 0 and result.stdout:
-        return result.stdout
-    raise Exception("ExifTool image conversion failed.")
+    # Windows exiftool.exe unpacks to a shared temp dir; parallel copies collide.
+    # -fast2 also skips MakerNotes / extra boxes that CR3 previews live in.
+    last_err = ""
+    with exiftool_lock:
+        for tag in PREVIEW_TAGS:
+            result = subprocess.run(
+                [EXIFTOOL_PATH, "-b", f"-{tag}", raw_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            jpeg_bytes = result.stdout or b""
+            if jpeg_bytes.startswith(b"\xff\xd8"):
+                return jpeg_bytes
+            err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+            if err:
+                last_err = err
+    detail = f" ({last_err})" if last_err else ""
+    raise Exception(f"ExifTool image conversion failed.{detail}")
 
 
 def jpeg_to_base64(jpeg_bytes):
